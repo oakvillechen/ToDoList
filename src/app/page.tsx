@@ -1,22 +1,24 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { supabase } from "@/lib/supabaseClient";
 
 type Priority = "low" | "medium" | "high";
 
-interface Todo {
-  id: number;
+type Filter = "all" | "active" | "completed";
+
+interface TodoRow {
+  id: string;
+  user_id: string;
+  date: string;
   text: string;
   completed: boolean;
-  /** ISO date string, e.g. 2026-02-05 */
-  date: string;
-  /** ISO timestamp */
-  createdAt: string;
+  created_at: string;
   priority: Priority;
-  notes?: string;
+  notes: string | null;
 }
 
-type Filter = "all" | "active" | "completed";
+type Todo = TodoRow;
 
 function getTodayISODate() {
   const now = new Date();
@@ -65,16 +67,13 @@ function priorityClasses(priority: Priority) {
 }
 
 export default function Home() {
-  const [todos, setTodos] = useState<Todo[]>(() => {
-    if (typeof window === "undefined") return [];
-    const stored = window.localStorage.getItem("todos-by-date-v3");
-    if (!stored) return [];
-    try {
-      return JSON.parse(stored);
-    } catch {
-      return [];
-    }
-  });
+  const [sessionUserId, setSessionUserId] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [loadingTodos, setLoadingTodos] = useState(false);
 
   const [input, setInput] = useState("");
   const [notes, setNotes] = useState("");
@@ -83,49 +82,93 @@ export default function Home() {
   const [selectedDate, setSelectedDate] = useState<string>(getTodayISODate);
   const [today] = useState<string>(getTodayISODate);
 
-  // Save to localStorage whenever todos change
+  // --- Auth setup ---
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem("todos-by-date-v3", JSON.stringify(todos));
-  }, [todos]);
+    const init = async () => {
+      const { data } = await supabase.auth.getUser();
+      if (data.user) {
+        setSessionUserId(data.user.id);
+      }
+    };
+    init();
 
-  const addTodo = () => {
-    const text = input.trim();
-    if (!text) return;
-    const now = new Date();
-    const isoDate = selectedDate || getTodayISODate();
-
-    setTodos((prev) => [
-      {
-        id: now.getTime(),
-        text,
-        completed: false,
-        date: isoDate,
-        createdAt: now.toISOString(),
-        priority,
-        notes: notes.trim() || undefined,
-      },
-      ...prev,
-    ]);
-    setInput("");
-    setNotes("");
-  };
-
-  const toggleTodo = (id: number) => {
-    setTodos((prev) =>
-      prev.map((todo) =>
-        todo.id === id ? { ...todo, completed: !todo.completed } : todo
-      )
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      async (_event, session) => {
+        if (session?.user) {
+          setSessionUserId(session.user.id);
+        } else {
+          setSessionUserId(null);
+          setTodos([]);
+        }
+      }
     );
+
+    return () => {
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // --- Load todos from Supabase when logged in ---
+  useEffect(() => {
+    const loadTodos = async () => {
+      if (!sessionUserId) return;
+      setLoadingTodos(true);
+      const { data, error } = await supabase
+        .from("todos")
+        .select("id, user_id, date, text, completed, created_at, priority, notes")
+        .order("date", { ascending: false })
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("Error loading todos", error.message);
+      } else if (data) {
+        setTodos(data as Todo[]);
+      }
+      setLoadingTodos(false);
+    };
+
+    loadTodos();
+  }, [sessionUserId]);
+
+  // --- Auth actions ---
+  const handleSendMagicLink = async () => {
+    if (!authEmail.trim()) return;
+    setAuthLoading(true);
+    setAuthMessage(null);
+    const { error } = await supabase.auth.signInWithOtp({
+      email: authEmail.trim(),
+      options: {
+        emailRedirectTo:
+          typeof window !== "undefined" ? window.location.origin : undefined,
+      },
+    });
+    if (error) {
+      setAuthMessage(error.message);
+    } else {
+      setAuthMessage("Magic link sent! Check your email to sign in.");
+    }
+    setAuthLoading(false);
   };
 
-  const deleteTodo = (id: number) => {
-    setTodos((prev) => prev.filter((todo) => todo.id !== id));
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setTodos([]);
   };
 
-  const clearCompleted = () => {
-    setTodos((prev) => prev.filter((todo) => !todo.completed));
+  // --- Local helpers ---
+  const handleKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (e) => {
+    if (e.key === "Enter") {
+      addTodo();
+    }
   };
+
+  const quickDates = [
+    { label: "Today", value: today },
+    { label: "Tomorrow", value: addDays(today, 1) },
+    { label: "+1 Week", value: addDays(today, 7) },
+  ];
+
+  const weekStrip = Array.from({ length: 7 }, (_, i) => addDays(today, i));
 
   const remainingCount = useMemo(
     () => todos.filter((t) => t.date === selectedDate && !t.completed).length,
@@ -143,28 +186,148 @@ export default function Home() {
     return Array.from(map.entries()).sort(([a], [b]) => (a < b ? 1 : -1));
   }, [todos]);
 
-  const handleKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (e) => {
-    if (e.key === "Enter") {
-      addTodo();
+  // --- CRUD actions wired to Supabase ---
+  const addTodo = async () => {
+    if (!sessionUserId) {
+      setAuthMessage("Please sign in first to save tasks in the cloud.");
+      return;
+    }
+    const text = input.trim();
+    if (!text) return;
+
+    const isoDate = selectedDate || getTodayISODate();
+    const payload = {
+      user_id: sessionUserId,
+      text,
+      date: isoDate,
+      completed: false,
+      priority,
+      notes: notes.trim() || null,
+    };
+
+    const { data, error } = await supabase
+      .from("todos")
+      .insert(payload)
+      .select("id, user_id, date, text, completed, created_at, priority, notes")
+      .single();
+
+    if (error) {
+      console.error("Error adding todo", error.message);
+      setAuthMessage("Could not save task. Try again.");
+      return;
+    }
+
+    setTodos((prev) => [data as Todo, ...prev]);
+    setInput("");
+    setNotes("");
+  };
+
+  const toggleTodo = async (id: string, completed: boolean) => {
+    const { data, error } = await supabase
+      .from("todos")
+      .update({ completed: !completed })
+      .eq("id", id)
+      .select("id, user_id, date, text, completed, created_at, priority, notes")
+      .single();
+
+    if (error) {
+      console.error("Error toggling todo", error.message);
+      return;
+    }
+
+    setTodos((prev) => prev.map((t) => (t.id === id ? (data as Todo) : t)));
+  };
+
+  const deleteTodo = async (id: string) => {
+    const prev = todos;
+    setTodos((cur) => cur.filter((t) => t.id !== id));
+    const { error } = await supabase.from("todos").delete().eq("id", id);
+    if (error) {
+      console.error("Error deleting todo", error.message);
+      setTodos(prev); // rollback on error
     }
   };
 
-  const quickDates = [
-    { label: "Today", value: today },
-    { label: "Tomorrow", value: addDays(today, 1) },
-    { label: "+1 Week", value: addDays(today, 7) },
-  ];
+  const clearCompleted = async () => {
+    const completedIds = todos.filter((t) => t.completed).map((t) => t.id);
+    if (!completedIds.length) return;
+    const prev = todos;
+    setTodos((cur) => cur.filter((t) => !t.completed));
+    const { error } = await supabase
+      .from("todos")
+      .delete()
+      .in("id", completedIds);
+    if (error) {
+      console.error("Error clearing completed", error.message);
+      setTodos(prev);
+    }
+  };
 
-  const weekStrip = Array.from({ length: 7 }, (_, i) => addDays(today, i));
-
+  // --- UI ---
   return (
     <div className="min-h-screen bg-gradient-to-br from-sky-100 via-violet-100 to-pink-100 text-slate-900 flex items-center justify-center px-4 py-10">
       <main className="w-full max-w-5xl space-y-6">
+        {/* Auth bar */}
+        <section className="rounded-2xl bg-white/80 backdrop-blur border border-white/70 shadow-sm px-4 py-3 flex flex-col sm:flex-row items-center justify-between gap-3 text-sm">
+          {sessionUserId ? (
+            <>
+              <div className="text-slate-700 text-sm">
+                <span className="font-medium">Signed in</span>
+                <span className="ml-2 text-xs text-slate-500">
+                  Your tasks are synced to the cloud.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+              >
+                Log out
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="flex-1 flex flex-col gap-1">
+                <p className="text-sm font-medium text-slate-800">
+                  Sign in with your email
+                </p>
+                <p className="text-xs text-slate-500">
+                  We9ll send you a magic link. Use the same email on any device
+                  to see your tasks.
+                </p>
+              </div>
+              <div className="flex flex-col sm:flex-row items-center gap-2 w-full sm:w-auto">
+                <input
+                  type="email"
+                  placeholder="you@example.com"
+                  className="w-full sm:w-56 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm outline-none ring-2 ring-transparent focus:border-sky-400 focus:ring-sky-100"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                />
+                <button
+                  type="button"
+                  onClick={handleSendMagicLink}
+                  disabled={authLoading || !authEmail.trim()}
+                  className="rounded-full bg-sky-600 px-4 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {authLoading ? "Sending..." : "Send magic link"}
+                </button>
+              </div>
+            </>
+          )}
+        </section>
+
+        {authMessage && (
+          <p className="text-xs text-slate-600 bg-white/70 border border-slate-200 rounded-xl px-3 py-2">
+            {authMessage}
+          </p>
+        )}
+
         {/* Header */}
         <header className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
           <div>
             <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-slate-900 drop-shadow-sm">
-              Daily To‑Do Planner
+              Daily ToDo Planner
             </h1>
             <p className="mt-1 text-base text-slate-600 max-w-md">
               Plan by day, set priority, and add notes. Each date gets its own
@@ -246,11 +409,12 @@ export default function Home() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
+                  disabled={!sessionUserId}
                 />
                 <button
                   onClick={addTodo}
                   className="rounded-xl bg-gradient-to-r from-sky-500 to-violet-500 px-3 sm:px-4 py-2 text-xs sm:text-sm font-medium text-white shadow-sm hover:from-sky-600 hover:to-violet-600 active:from-sky-700 active:to-violet-700 disabled:opacity-40 disabled:cursor-not-allowed"
-                  disabled={!input.trim()}
+                  disabled={!input.trim() || !sessionUserId}
                 >
                   Add
                 </button>
@@ -276,10 +440,11 @@ export default function Home() {
             </div>
 
             <textarea
-              className="min-h-[60px] rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs sm:text-sm outline-none ring-2 ring-transparent focus:border-sky-400 focus:ring-sky-100 resize-y"
+              className="min-h-[60px] rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none ring-2 ring-transparent focus:border-sky-400 focus:ring-sky-100 resize-y"
               placeholder="Optional notes or details for this task (e.g. where, who, links)"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
+              disabled={!sessionUserId}
             />
           </div>
 
@@ -303,7 +468,9 @@ export default function Home() {
 
             <div className="flex items-center gap-3">
               <p className="text-xs sm:text-sm text-slate-500">
-                {remainingCount === 0
+                {loadingTodos
+                  ? "Loading your tasks..."
+                  : remainingCount === 0
                   ? "All done for this day! ✅"
                   : `${remainingCount} task${
                       remainingCount === 1 ? "" : "s"
@@ -312,7 +479,7 @@ export default function Home() {
               <button
                 onClick={clearCompleted}
                 className="text-xs sm:text-sm text-rose-500 hover:text-rose-600 disabled:text-slate-300 disabled:cursor-not-allowed"
-                disabled={!todos.some((t) => t.completed)}
+                disabled={!todos.some((t) => t.completed) || !sessionUserId}
               >
                 Clear completed
               </button>
@@ -322,9 +489,10 @@ export default function Home() {
 
         {/* Date cards */}
         {groupedByDate.length === 0 ? (
-          <p className="mt-4 text-center text-sm text-slate-600">
-            No tasks yet. Pick a date above, add a task, and your first day
-            card will appear here.
+          <p className="mt-4 text-center text-base text-slate-600">
+            {sessionUserId
+              ? "No tasks yet. Pick a date above, add a task, and your first day card will appear here."
+              : "Sign in with your email above to start creating cloud-synced tasks."}
           </p>
         ) : (
           <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -368,7 +536,7 @@ export default function Home() {
                     {items
                       .slice()
                       .sort((a, b) =>
-                        a.createdAt < b.createdAt ? 1 : -1
+                        a.created_at < b.created_at ? 1 : -1
                       )
                       .map((todo) => (
                         <li
@@ -376,7 +544,7 @@ export default function Home() {
                           className="group/item flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-2.5 py-1.5 hover:bg-slate-50"
                         >
                           <button
-                            onClick={() => toggleTodo(todo.id)}
+                            onClick={() => toggleTodo(todo.id, todo.completed)}
                             className={`mt-1 flex h-5 w-5 flex-none items-center justify-center rounded-full border text-[10px] transition-colors ${
                               todo.completed
                                 ? "border-emerald-500 bg-emerald-500 text-white"
@@ -416,7 +584,7 @@ export default function Home() {
                             )}
                             <p className="text-[10px] text-slate-400">
                               Added at{" "}
-                              {new Date(todo.createdAt).toLocaleTimeString(
+                              {new Date(todo.created_at).toLocaleTimeString(
                                 undefined,
                                 {
                                   hour: "2-digit",
