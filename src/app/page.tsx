@@ -139,7 +139,7 @@ export default function Home() {
       email: authEmail.trim(),
       options: {
         emailRedirectTo:
-          typeof window !== "undefined" ? window.location.origin : undefined,
+          "https://to-do-list-gamma-henna.vercel.app", // always send magic links to the live app
       },
     });
     if (error) {
