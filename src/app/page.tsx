@@ -68,6 +68,7 @@ function priorityClasses(priority: Priority) {
 
 export default function Home() {
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
+  const [username, setUsername] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "signup" | "reset">("login");
   const [authUsername, setAuthUsername] = useState("");
   const [authEmail, setAuthEmail] = useState("");
@@ -77,6 +78,10 @@ export default function Home() {
 
   const [todos, setTodos] = useState<Todo[]>([]);
   const [loadingTodos, setLoadingTodos] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editNotes, setEditNotes] = useState("");
+  const [editPriority, setEditPriority] = useState<Priority>("medium");
 
   const [input, setInput] = useState("");
   const [notes, setNotes] = useState("");
@@ -91,12 +96,14 @@ export default function Home() {
       // Dev mode bypass - auto-login with mock user
       if (process.env.NODE_ENV === "development") {
         setSessionUserId("dev-user-local");
+        setUsername("Dev User");
         return;
       }
 
       const { data } = await supabase.auth.getUser();
       if (data.user) {
         setSessionUserId(data.user.id);
+        setUsername(data.user.user_metadata?.username || data.user.email?.split('@')[0] || "User");
       }
     };
     init();
@@ -110,8 +117,10 @@ export default function Home() {
       async (_event, session) => {
         if (session?.user) {
           setSessionUserId(session.user.id);
+          setUsername(session.user.user_metadata?.username || session.user.email?.split('@')[0] || "User");
         } else {
           setSessionUserId(null);
+          setUsername(null);
           setTodos([]);
         }
       }
@@ -246,11 +255,13 @@ export default function Home() {
     // In dev mode, just clear the mock user
     if (process.env.NODE_ENV === "development") {
       setSessionUserId(null);
+      setUsername(null);
       setTodos([]);
       return;
     }
 
     await supabase.auth.signOut();
+    setUsername(null);
     setTodos([]);
   };
 
@@ -281,11 +292,7 @@ export default function Home() {
     }
   };
 
-  const quickDates = [
-    { label: "Today", value: today },
-    { label: "Tomorrow", value: addDays(today, 1) },
-    { label: "+1 Week", value: addDays(today, 7) },
-  ];
+
 
   const weekStrip = Array.from({ length: 7 }, (_, i) => addDays(today, i));
 
@@ -407,6 +414,76 @@ export default function Home() {
     }
   };
 
+  const updateTodo = async (id: string, text: string, notes: string, priority: Priority) => {
+    // In dev mode, use localStorage
+    if (process.env.NODE_ENV === "development") {
+      const updated = todos.map((t) =>
+        t.id === id ? { ...t, text, notes: notes.trim() || null, priority } : t
+      );
+      setTodos(updated);
+      localStorage.setItem("dev-todos", JSON.stringify(updated));
+      setEditingId(null);
+      return;
+    }
+
+    // Production: use Supabase
+    const { data, error } = await supabase
+      .from("todos")
+      .update({ text, notes: notes.trim() || null, priority })
+      .eq("id", id)
+      .select("id, user_id, date, text, completed, created_at, priority, notes")
+      .single();
+
+    if (error) {
+      console.error("Error updating todo", error.message);
+      return;
+    }
+
+    setTodos((prev) => prev.map((t) => (t.id === id ? (data as Todo) : t)));
+    setEditingId(null);
+  };
+
+  const moveTodo = async (id: string, newDate: string) => {
+    // In dev mode, use localStorage
+    if (process.env.NODE_ENV === "development") {
+      const updated = todos.map((t) =>
+        t.id === id ? { ...t, date: newDate } : t
+      );
+      setTodos(updated);
+      localStorage.setItem("dev-todos", JSON.stringify(updated));
+      return;
+    }
+
+    // Production: use Supabase
+    const { data, error } = await supabase
+      .from("todos")
+      .update({ date: newDate })
+      .eq("id", id)
+      .select("id, user_id, date, text, completed, created_at, priority, notes")
+      .single();
+
+    if (error) {
+      console.error("Error moving todo", error.message);
+      return;
+    }
+
+    setTodos((prev) => prev.map((t) => (t.id === id ? (data as Todo) : t)));
+  };
+
+  const startEdit = (todo: Todo) => {
+    setEditingId(todo.id);
+    setEditText(todo.text);
+    setEditNotes(todo.notes || "");
+    setEditPriority(todo.priority);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditText("");
+    setEditNotes("");
+    setEditPriority("medium");
+  };
+
   const clearCompleted = async () => {
     const completedIds = todos.filter((t) => t.completed).map((t) => t.id);
     if (!completedIds.length) return;
@@ -444,12 +521,12 @@ export default function Home() {
                   <>
                     <span className="font-medium">🔧 Development Mode</span>
                     <span className="ml-2 text-xs text-slate-500">
-                      Authentication bypassed for local development
+                      Signed in as {username}
                     </span>
                   </>
                 ) : (
                   <>
-                    <span className="font-medium">Signed in</span>
+                    <span className="font-medium">Signed in as {username}</span>
                     <span className="ml-2 text-xs text-slate-500">
                       Your tasks are synced to the cloud.
                     </span>
@@ -623,48 +700,12 @@ export default function Home() {
             <header className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
               <div>
                 <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-slate-900 drop-shadow-sm">
-                  Daily ToDo Planner
+                  Daily To‑Do Planner
                 </h1>
                 <p className="mt-1 text-base text-slate-600 max-w-md">
                   Plan by day, set priority, and add notes. Each date gets its own
                   card so you can see your week at a glance.
                 </p>
-              </div>
-
-              {/* Date controls */}
-              <div className="flex flex-col gap-3">
-                {/* Quick chips */}
-                <div className="flex flex-wrap gap-2 justify-end">
-                  {quickDates.map((d) => (
-                    <button
-                      key={d.value}
-                      type="button"
-                      onClick={() => setSelectedDate(d.value)}
-                      className={`rounded-full border px-3 py-1 text-xs sm:text-sm transition-colors backdrop-blur ${selectedDate === d.value
-                        ? "bg-sky-600 text-white border-sky-600 shadow-sm"
-                        : "bg-white/80 text-slate-700 border-slate-200 hover:bg-sky-50"
-                        }`}
-                    >
-                      {d.label}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Date picker + label */}
-                <div className="rounded-2xl bg-white/80 backdrop-blur border border-white/60 px-4 py-3 shadow-sm flex flex-col text-sm text-slate-700">
-                  <span className="font-medium">Selected day</span>
-                  <span className="text-xs text-slate-500 mb-1">
-                    {formatDisplayDate(selectedDate)}
-                  </span>
-                  <input
-                    type="date"
-                    className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-xs outline-none ring-2 ring-transparent focus:border-sky-400 focus:ring-sky-100"
-                    value={selectedDate}
-                    onChange={(e) =>
-                      setSelectedDate(e.target.value || getTodayISODate())
-                    }
-                  />
-                </div>
               </div>
             </header>
 
@@ -694,6 +735,21 @@ export default function Home() {
             <section className="rounded-2xl bg-white/90 backdrop-blur border border-white/80 shadow-lg p-4 sm:p-5 flex flex-col gap-4">
               {/* Inputs row */}
               <div className="flex flex-col gap-3">
+                {/* Date picker + label */}
+                <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2 flex items-center gap-3 text-sm">
+                  <span className="font-medium text-slate-700">Add task for:</span>
+                  <span className="text-xs text-slate-500">
+                    {formatDisplayDate(selectedDate)}
+                  </span>
+                  <input
+                    type="date"
+                    className="ml-auto rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs outline-none ring-2 ring-transparent focus:border-sky-400 focus:ring-sky-100"
+                    value={selectedDate}
+                    onChange={(e) =>
+                      setSelectedDate(e.target.value || getTodayISODate())
+                    }
+                  />
+                </div>
                 <div className="flex flex-col sm:flex-row gap-3">
                   <div className="flex-1 flex gap-2">
                     <input
@@ -825,71 +881,151 @@ export default function Home() {
                       <ul className="space-y-2 text-base">
                         {items
                           .slice()
+                          .filter((todo) => {
+                            if (filter === "active") return !todo.completed;
+                            if (filter === "completed") return todo.completed;
+                            return true; // "all"
+                          })
                           .sort((a, b) =>
                             a.created_at < b.created_at ? 1 : -1
                           )
-                          .map((todo) => (
-                            <li
-                              key={todo.id}
-                              className="group/item flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2.5 hover:bg-slate-50"
-                            >
-                              <button
-                                onClick={() => toggleTodo(todo.id, todo.completed)}
-                                className={`mt-1 flex h-6 w-6 flex-none items-center justify-center rounded-full border text-sm transition-colors ${todo.completed
-                                  ? "border-emerald-500 bg-emerald-500 text-white"
-                                  : "border-slate-300 bg-white text-transparent group-hover/item:border-slate-400"
-                                  }`}
-                                aria-label={
-                                  todo.completed
-                                    ? "Mark as not completed"
-                                    : "Mark as completed"
-                                }
+                          .map((todo) => {
+                            const isEditing = editingId === todo.id;
+                            return (
+                              <li
+                                key={todo.id}
+                                className="group/item flex flex-col gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2.5 hover:bg-slate-50"
                               >
-                                ✓
-                              </button>
-                              <div className="flex-1 min-w-0 space-y-1">
-                                <div className="flex items-center justify-between gap-2">
-                                  <p
-                                    className={`truncate text-base font-medium ${todo.completed
-                                      ? "text-slate-400 line-through"
-                                      : "text-slate-800"
-                                      }`}
-                                  >
-                                    {todo.text}
-                                  </p>
-                                  <span
-                                    className={`ml-2 shrink-0 rounded-full border px-2.5 py-1 text-xs font-medium ${priorityClasses(
-                                      todo.priority
-                                    )}`}
-                                  >
-                                    {priorityLabel(todo.priority)}
-                                  </span>
-                                </div>
-                                {todo.notes && (
-                                  <p className="text-sm text-slate-600 whitespace-pre-wrap break-words">
-                                    {todo.notes}
-                                  </p>
+                                {isEditing ? (
+                                  // Edit mode
+                                  <div className="flex flex-col gap-2">
+                                    <input
+                                      type="text"
+                                      className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
+                                      value={editText}
+                                      onChange={(e) => setEditText(e.target.value)}
+                                    />
+                                    <textarea
+                                      className="min-h-[50px] rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100 resize-y"
+                                      placeholder="Notes"
+                                      value={editNotes}
+                                      onChange={(e) => setEditNotes(e.target.value)}
+                                    />
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-xs text-slate-500">Priority:</span>
+                                      {["low", "medium", "high"].map((p) => (
+                                        <button
+                                          key={p}
+                                          type="button"
+                                          onClick={() => setEditPriority(p as Priority)}
+                                          className={`rounded-full border px-2 py-0.5 text-[10px] capitalize transition-colors ${editPriority === p
+                                            ? "bg-slate-900 text-white border-slate-900"
+                                            : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                                            }`}
+                                        >
+                                          {p}
+                                        </button>
+                                      ))}
+                                    </div>
+                                    <div className="flex gap-2">
+                                      <button
+                                        onClick={() => updateTodo(todo.id, editText, editNotes, editPriority)}
+                                        className="flex-1 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-700"
+                                        disabled={!editText.trim()}
+                                      >
+                                        Save
+                                      </button>
+                                      <button
+                                        onClick={cancelEdit}
+                                        className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  // View mode
+                                  <>
+                                    <div className="flex items-start gap-3">
+                                      <button
+                                        onClick={() => toggleTodo(todo.id, todo.completed)}
+                                        className={`mt-1 flex h-6 w-6 flex-none items-center justify-center rounded-full border text-sm transition-colors ${todo.completed
+                                          ? "border-emerald-500 bg-emerald-500 text-white"
+                                          : "border-slate-300 bg-white text-transparent group-hover/item:border-slate-400"
+                                          }`}
+                                        aria-label={
+                                          todo.completed
+                                            ? "Mark as not completed"
+                                            : "Mark as completed"
+                                        }
+                                      >
+                                        ✓
+                                      </button>
+                                      <div className="flex-1 min-w-0 space-y-1">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <p
+                                            className={`truncate text-base font-medium ${todo.completed
+                                              ? "text-slate-400 line-through"
+                                              : "text-slate-800"
+                                              }`}
+                                          >
+                                            {todo.text}
+                                          </p>
+                                          <span
+                                            className={`ml-2 shrink-0 rounded-full border px-2.5 py-1 text-xs font-medium ${priorityClasses(
+                                              todo.priority
+                                            )}`}
+                                          >
+                                            {priorityLabel(todo.priority)}
+                                          </span>
+                                        </div>
+                                        {todo.notes && (
+                                          <p className="text-sm text-slate-600 whitespace-pre-wrap break-words">
+                                            {todo.notes}
+                                          </p>
+                                        )}
+                                        <p className="text-xs text-slate-400">
+                                          Added at{" "}
+                                          {new Date(todo.created_at).toLocaleTimeString(
+                                            undefined,
+                                            {
+                                              hour: "2-digit",
+                                              minute: "2-digit",
+                                            }
+                                          )}
+                                        </p>
+                                      </div>
+                                      <button
+                                        onClick={() => deleteTodo(todo.id)}
+                                        className="mt-0.5 flex h-6 w-6 flex-none items-center justify-center rounded-full text-xs text-slate-400 hover:bg-rose-50 hover:text-rose-500"
+                                        aria-label="Delete task"
+                                      >
+                                        ✕
+                                      </button>
+                                    </div>
+                                    {/* Action buttons */}
+                                    <div className="flex gap-2 ml-9">
+                                      <button
+                                        onClick={() => startEdit(todo)}
+                                        className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                                      >
+                                        ✏️ Edit
+                                      </button>
+                                      <div className="flex items-center gap-1">
+                                        <span className="text-xs text-slate-500">Move to:</span>
+                                        <input
+                                          type="date"
+                                          className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
+                                          value={todo.date}
+                                          onChange={(e) => moveTodo(todo.id, e.target.value)}
+                                        />
+                                      </div>
+                                    </div>
+                                  </>
                                 )}
-                                <p className="text-xs text-slate-400">
-                                  Added at{" "}
-                                  {new Date(todo.created_at).toLocaleTimeString(
-                                    undefined,
-                                    {
-                                      hour: "2-digit",
-                                      minute: "2-digit",
-                                    }
-                                  )}
-                                </p>
-                              </div>
-                              <button
-                                onClick={() => deleteTodo(todo.id)}
-                                className="mt-0.5 flex h-6 w-6 flex-none items-center justify-center rounded-full text-xs text-slate-400 hover:bg-rose-50 hover:text-rose-500"
-                                aria-label="Delete task"
-                              >
-                                ✕
-                              </button>
-                            </li>
-                          ))}
+                              </li>
+                            );
+                          })}
                       </ul>
                     </article>
                   );
